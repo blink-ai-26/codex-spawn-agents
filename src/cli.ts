@@ -5,23 +5,34 @@ import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { Codex, type SandboxMode, type ThreadEvent, type ThreadOptions, type Usage } from "@openai/codex-sdk";
 
-const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const satisfies readonly SandboxMode[];
+const SANDBOX_MODES: readonly SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
 
-const HELP_TEXT = `codex-spawn - launch one or more Codex agents\n\nUsage:\n  codex-spawn "summarize the repo structure"\n  codex-spawn -p "review security" -p "review code quality"\n\nOptions:\n  -p <prompt>               Run an agent with the given prompt. Repeat for parallel agents.\n  --model <model>           Model override\n  --sandbox <mode>          read-only (default), workspace-write, danger-full-access\n  --full-auto               Shorthand for --sandbox danger-full-access\n  --json                    Output JSONL stream events to stdout\n  --cwd <path>              Working directory for agents (default: current directory)\n  -o, --output <path>       Write final results to file\n  --help                    Show help\n`;
+const HELP = `\
+codex-spawn - launch one or more Codex agents
+
+Usage:
+  codex-spawn "summarize the repo structure"
+  codex-spawn -p "review security" -p "review code quality"
+
+Options:
+  -p <prompt>               Run an agent with the given prompt. Repeat for parallel agents.
+  --model <model>           Model override
+  --sandbox <mode>          read-only (default), workspace-write, danger-full-access
+  --full-auto               Shorthand for --sandbox danger-full-access
+  --json                    Output JSONL stream events to stdout
+  --cwd <path>              Working directory for agents (default: current directory)
+  -o, --output <path>       Write final results to file
+  --help                    Show help`;
+
+// -- Types --
 
 export type CliConfig = {
-  help: boolean;
   prompts: string[];
   model?: string;
   sandboxMode: SandboxMode;
   json: boolean;
   cwd: string;
   output?: string;
-};
-
-type AgentTask = {
-  index: number;
-  prompt: string;
 };
 
 type AgentResult = {
@@ -34,442 +45,236 @@ type AgentResult = {
   error?: string;
 };
 
-export function parseCliArgs(argv: string[]): CliConfig {
-  const parsed = parseArgs({
+// -- Arg parsing --
+
+export function parseCliArgs(argv: string[]): CliConfig | "help" {
+  const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
     strict: true,
     options: {
-      prompt: {
-        type: "string",
-        short: "p",
-        multiple: true,
-      },
-      model: {
-        type: "string",
-      },
-      sandbox: {
-        type: "string",
-      },
-      "full-auto": {
-        type: "boolean",
-      },
-      json: {
-        type: "boolean",
-      },
-      cwd: {
-        type: "string",
-      },
-      output: {
-        type: "string",
-        short: "o",
-      },
-      help: {
-        type: "boolean",
-      },
+      prompt: { type: "string", short: "p", multiple: true },
+      model: { type: "string" },
+      sandbox: { type: "string" },
+      "full-auto": { type: "boolean" },
+      json: { type: "boolean" },
+      cwd: { type: "string" },
+      output: { type: "string", short: "o" },
+      help: { type: "boolean" },
     },
   });
 
-  const promptFlags = parsed.values.prompt ?? [];
-  const positionalPromptCount = parsed.positionals.length;
+  if (values.help) return "help";
 
-  if (positionalPromptCount > 0 && promptFlags.length > 0) {
+  const promptFlags = values.prompt ?? [];
+
+  if (positionals.length > 0 && promptFlags.length > 0) {
     throw new Error("Cannot mix a positional prompt with -p/--prompt flags.");
   }
-
-  if (positionalPromptCount > 1) {
+  if (positionals.length > 1) {
     throw new Error("Only one positional prompt is allowed.");
   }
 
-  const requestedSandbox = parsed.values.sandbox;
-  const fullAuto = parsed.values["full-auto"] ?? false;
+  const prompts = positionals.length === 1 ? [positionals[0]!] : promptFlags;
+  if (prompts.length === 0) {
+    throw new Error("Provide a prompt as a positional argument or with one or more -p flags.");
+  }
 
-  if (fullAuto && requestedSandbox && requestedSandbox !== "danger-full-access") {
+  const fullAuto = values["full-auto"] ?? false;
+  const sandbox = values.sandbox;
+
+  if (fullAuto && sandbox && sandbox !== "danger-full-access") {
     throw new Error("--full-auto cannot be combined with a different --sandbox value.");
   }
 
-  const sandboxMode = (fullAuto ? "danger-full-access" : requestedSandbox ?? "read-only") as SandboxMode;
-
+  const sandboxMode = (fullAuto ? "danger-full-access" : sandbox ?? "read-only") as SandboxMode;
   if (!SANDBOX_MODES.includes(sandboxMode)) {
     throw new Error(`Invalid sandbox mode: ${sandboxMode}`);
   }
 
-  const prompts = positionalPromptCount === 1 ? [parsed.positionals[0]!] : promptFlags;
-
-  if (!parsed.values.help && prompts.length === 0) {
-    throw new Error("Provide a prompt as a positional argument or with one or more -p flags.");
-  }
-
   return {
-    help: parsed.values.help ?? false,
     prompts,
-    model: parsed.values.model,
+    model: values.model,
     sandboxMode,
-    json: parsed.values.json ?? false,
-    cwd: resolve(parsed.values.cwd ?? process.cwd()),
-    output: parsed.values.output,
+    json: values.json ?? false,
+    cwd: resolve(values.cwd ?? process.cwd()),
+    output: values.output,
   };
 }
 
-function formatUsage(usage: Usage | null): string {
-  if (!usage) {
-    return "usage unavailable";
-  }
+// -- Logging helpers --
 
-  return `tokens in=${usage.input_tokens} cached=${usage.cached_input_tokens} out=${usage.output_tokens}`;
-}
+const log = (s: string) => process.stderr.write(`${s}\n`);
+const out = (s: string) => process.stdout.write(`${s}\n`);
 
-function writeStdoutLine(line: string): void {
-  process.stdout.write(`${line}\n`);
-}
+// -- Event description --
 
-function writeStderrLine(line: string): void {
-  process.stderr.write(`${line}\n`);
-}
-
-function emitJsonLine(payload: unknown): void {
-  writeStdoutLine(JSON.stringify(payload));
-}
-
-function describeEvent(agentIndex: number, event: ThreadEvent): string | null {
-  switch (event.type) {
-    case "thread.started":
-      return `[agent ${agentIndex}] thread started: ${event.thread_id}`;
-    case "turn.started":
-      return `[agent ${agentIndex}] turn started`;
-    case "turn.completed":
-      return `[agent ${agentIndex}] completed (${formatUsage(event.usage)})`;
-    case "turn.failed":
-      return `[agent ${agentIndex}] failed: ${event.error.message}`;
-    case "error":
-      return `[agent ${agentIndex}] stream error: ${event.message}`;
-    case "item.started": {
-      switch (event.item.type) {
-        case "reasoning":
-          return `[agent ${agentIndex}] reasoning`;
-        case "todo_list":
-          return `[agent ${agentIndex}] planning`;
-        case "command_execution":
-          return `[agent ${agentIndex}] command: ${event.item.command}`;
-        case "web_search":
-          return `[agent ${agentIndex}] web search: ${event.item.query}`;
-        case "mcp_tool_call":
-          return `[agent ${agentIndex}] tool: ${event.item.server}/${event.item.tool}`;
-        case "file_change":
-          return `[agent ${agentIndex}] applying file changes`;
-        case "agent_message":
-          return `[agent ${agentIndex}] responding`;
-        case "error":
-          return `[agent ${agentIndex}] error: ${event.item.message}`;
-      }
+function describeEvent(i: number, e: ThreadEvent): string | null {
+  const tag = `[agent ${i}]`;
+  switch (e.type) {
+    case "thread.started": return `${tag} thread started: ${e.thread_id}`;
+    case "turn.started": return `${tag} turn started`;
+    case "turn.completed": {
+      const u = e.usage;
+      const usage = u ? `in=${u.input_tokens} cached=${u.cached_input_tokens} out=${u.output_tokens}` : "n/a";
+      return `${tag} completed (${usage})`;
     }
-    case "item.completed": {
-      switch (event.item.type) {
-        case "command_execution":
-          return `[agent ${agentIndex}] command ${event.item.status}${event.item.exit_code === undefined ? "" : ` (exit ${event.item.exit_code})`}`;
-        case "mcp_tool_call":
-          return `[agent ${agentIndex}] tool ${event.item.status}: ${event.item.server}/${event.item.tool}`;
-        case "file_change":
-          return `[agent ${agentIndex}] file changes ${event.item.status}`;
-        case "error":
-          return `[agent ${agentIndex}] error: ${event.item.message}`;
-        default:
-          return null;
+    case "turn.failed": return `${tag} failed: ${e.error.message}`;
+    case "error": return `${tag} stream error: ${e.message}`;
+    case "item.started":
+      switch (e.item.type) {
+        case "reasoning": return `${tag} reasoning`;
+        case "todo_list": return `${tag} planning`;
+        case "command_execution": return `${tag} command: ${e.item.command}`;
+        case "web_search": return `${tag} web search: ${e.item.query}`;
+        case "mcp_tool_call": return `${tag} tool: ${e.item.server}/${e.item.tool}`;
+        case "file_change": return `${tag} applying file changes`;
+        case "agent_message": return `${tag} responding`;
+        case "error": return `${tag} error: ${e.item.message}`;
       }
-    }
-    case "item.updated":
-      return null;
+      break;
+    case "item.completed":
+      switch (e.item.type) {
+        case "command_execution":
+          return `${tag} command ${e.item.status}${e.item.exit_code != null ? ` (exit ${e.item.exit_code})` : ""}`;
+        case "mcp_tool_call": return `${tag} tool ${e.item.status}: ${e.item.server}/${e.item.tool}`;
+        case "file_change": return `${tag} file changes ${e.item.status}`;
+        case "error": return `${tag} error: ${e.item.message}`;
+        default: return null;
+      }
+    case "item.updated": return null;
   }
+  return null;
 }
 
-function updateFinalResponse(current: string, event: ThreadEvent): string {
-  if (
-    (event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed") &&
-    event.item.type === "agent_message"
-  ) {
-    return event.item.text;
-  }
+// -- Agent runner --
 
-  return current;
+function result(
+  index: number, prompt: string, success: boolean,
+  finalResponse: string, usage: Usage | null, threadId: string | null,
+  error?: string,
+): AgentResult {
+  return { index, prompt, success, finalResponse, usage, threadId, ...(error ? { error } : {}) };
 }
 
 async function runAgent(
-  codex: Codex,
-  task: AgentTask,
-  threadOptions: ThreadOptions,
-  signal: AbortSignal,
-  json: boolean,
+  codex: Codex, index: number, prompt: string,
+  opts: ThreadOptions, signal: AbortSignal, json: boolean,
 ): Promise<AgentResult> {
-  const thread = codex.startThread(threadOptions);
+  const thread = codex.startThread(opts);
   let finalResponse = "";
   let usage: Usage | null = null;
   let threadId: string | null = null;
-  let completed = false;
+
+  const emitJson = (payload: unknown) => json && out(JSON.stringify(payload));
 
   try {
-    writeStderrLine(`[agent ${task.index}] starting`);
-    const streamedTurn = await thread.runStreamed(task.prompt, { signal });
+    log(`[agent ${index}] starting`);
+    const { events } = await thread.runStreamed(prompt, { signal });
 
-    for await (const event of streamedTurn.events) {
-      finalResponse = updateFinalResponse(finalResponse, event);
-
-      if (event.type === "thread.started") {
-        threadId = event.thread_id;
-      } else if (event.type === "turn.completed") {
-        usage = event.usage;
-        completed = true;
-      } else if (event.type === "turn.failed") {
-        const statusMessage = describeEvent(task.index, event);
-        if (statusMessage) {
-          writeStderrLine(statusMessage);
-        }
-
-        if (json) {
-          emitJsonLine({ agent: task.index, prompt: task.prompt, event });
-          emitJsonLine({
-            type: "agent.result",
-            agent: task.index,
-            prompt: task.prompt,
-            status: "failed",
-            threadId,
-            usage,
-            error: event.error.message,
-            finalResponse,
-          });
-        }
-
-        return {
-          index: task.index,
-          prompt: task.prompt,
-          success: false,
-          finalResponse,
-          usage,
-          threadId,
-          error: event.error.message,
-        };
-      } else if (event.type === "error") {
-        const statusMessage = describeEvent(task.index, event);
-        if (statusMessage) {
-          writeStderrLine(statusMessage);
-        }
-
-        if (json) {
-          emitJsonLine({ agent: task.index, prompt: task.prompt, event });
-          emitJsonLine({
-            type: "agent.result",
-            agent: task.index,
-            prompt: task.prompt,
-            status: "failed",
-            threadId,
-            usage,
-            error: event.message,
-            finalResponse,
-          });
-        }
-
-        return {
-          index: task.index,
-          prompt: task.prompt,
-          success: false,
-          finalResponse,
-          usage,
-          threadId,
-          error: event.message,
-        };
+    for await (const event of events) {
+      // Track agent message text
+      if ("item" in event && event.item.type === "agent_message") {
+        finalResponse = event.item.text;
       }
 
-      const statusMessage = describeEvent(task.index, event);
-      if (statusMessage) {
-        writeStderrLine(statusMessage);
+      if (event.type === "thread.started") threadId = event.thread_id;
+
+      // Terminal failure events
+      if (event.type === "turn.failed" || event.type === "error") {
+        const msg = describeEvent(index, event);
+        if (msg) log(msg);
+        const errMsg = event.type === "turn.failed" ? event.error.message : event.message;
+        emitJson({ agent: index, prompt, event });
+        return result(index, prompt, false, finalResponse, usage, threadId, errMsg);
       }
 
-      if (json) {
-        emitJsonLine({ agent: task.index, prompt: task.prompt, event });
-      }
+      if (event.type === "turn.completed") usage = event.usage;
+
+      const msg = describeEvent(index, event);
+      if (msg) log(msg);
+      emitJson({ agent: index, prompt, event });
     }
 
-    if (!completed) {
-      const error = signal.aborted ? "aborted" : "agent stream ended before completion";
-      if (json) {
-        emitJsonLine({
-          type: "agent.result",
-          agent: task.index,
-          prompt: task.prompt,
-          status: "failed",
-          threadId,
-          usage,
-          error,
-          finalResponse,
-        });
-      }
-
-      return {
-        index: task.index,
-        prompt: task.prompt,
-        success: false,
-        finalResponse,
-        usage,
-        threadId,
-        error,
-      };
+    const success = usage !== null; // turn.completed sets usage
+    if (!success) {
+      const err = signal.aborted ? "aborted" : "stream ended before completion";
+      return result(index, prompt, false, finalResponse, usage, threadId, err);
     }
 
-    if (json) {
-      emitJsonLine({
-        type: "agent.result",
-        agent: task.index,
-        prompt: task.prompt,
-        status: "completed",
-        threadId,
-        usage,
-        finalResponse,
-      });
-    }
-
-    return {
-      index: task.index,
-      prompt: task.prompt,
-      success: true,
-      finalResponse,
-      usage,
-      threadId,
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    writeStderrLine(`[agent ${task.index}] failed: ${message}`);
-
-    if (json) {
-      emitJsonLine({
-        type: "agent.result",
-        agent: task.index,
-        prompt: task.prompt,
-        status: signal.aborted ? "aborted" : "failed",
-        threadId,
-        usage,
-        error: message,
-        finalResponse,
-      });
-    }
-
-    return {
-      index: task.index,
-      prompt: task.prompt,
-      success: false,
-      finalResponse,
-      usage,
-      threadId,
-      error: message,
-    };
+    return result(index, prompt, true, finalResponse, usage, threadId);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log(`[agent ${index}] failed: ${message}`);
+    return result(index, prompt, false, finalResponse, usage, threadId, message);
   }
 }
 
-export function renderTextResults(results: AgentResult[]): string {
+// -- Output formatting --
+
+function renderText(results: AgentResult[]): string {
   if (results.length === 1) {
-    const [result] = results;
-    if (!result) {
-      return "";
-    }
-
-    if (result.success) {
-      return result.finalResponse.trimEnd();
-    }
-
-    return result.error ? `Error: ${result.error}` : "Error: agent failed";
+    const r = results[0]!;
+    return r.success ? r.finalResponse.trimEnd() : `Error: ${r.error ?? "agent failed"}`;
   }
-
   return results
-    .map((result) => {
-      const lines = [`Agent ${result.index}: ${result.prompt}`, result.success ? result.finalResponse.trimEnd() : `Error: ${result.error ?? "agent failed"}`];
-      return lines.join("\n");
-    })
+    .map((r) => `Agent ${r.index}: ${r.prompt}\n${r.success ? r.finalResponse.trimEnd() : `Error: ${r.error ?? "agent failed"}`}`)
     .join("\n\n");
 }
 
-export function renderJsonResults(results: AgentResult[]): string {
-  return JSON.stringify(
-    results.map((result) => ({
-      agent: result.index,
-      prompt: result.prompt,
-      status: result.success ? "completed" : "failed",
-      threadId: result.threadId,
-      usage: result.usage,
-      error: result.error ?? null,
-      finalResponse: result.finalResponse,
-    })),
-    null,
-    2,
-  );
-}
+// -- Main --
 
 async function main(argv: string[]): Promise<number> {
   let config: CliConfig;
-
   try {
-    config = parseCliArgs(argv);
-  } catch (error) {
-    writeStderrLine(error instanceof Error ? error.message : String(error));
-    writeStderrLine("");
-    writeStderrLine(HELP_TEXT.trimEnd());
+    const parsed = parseCliArgs(argv);
+    if (parsed === "help") { out(HELP); return 0; }
+    config = parsed;
+  } catch (err) {
+    log(err instanceof Error ? err.message : String(err));
+    log("");
+    log(HELP);
     return 1;
-  }
-
-  if (config.help) {
-    writeStdoutLine(HELP_TEXT.trimEnd());
-    return 0;
   }
 
   const controller = new AbortController();
   let interrupted = false;
-
   process.once("SIGINT", () => {
-    if (interrupted) {
-      process.exit(130);
-    }
-
+    if (interrupted) process.exit(130);
     interrupted = true;
-    writeStderrLine("Received SIGINT, aborting all running agents...");
+    log("Received SIGINT, aborting all agents...");
     controller.abort();
   });
 
   const codex = new Codex();
-  const threadOptions: ThreadOptions = {
+  const opts: ThreadOptions = {
     model: config.model,
     sandboxMode: config.sandboxMode,
     workingDirectory: config.cwd,
   };
 
-  const tasks = config.prompts.map((prompt, index) =>
-    runAgent(
-      codex,
-      {
-        index: index + 1,
-        prompt,
-      },
-      threadOptions,
-      controller.signal,
-      config.json,
+  const results = await Promise.all(
+    config.prompts.map((prompt, i) =>
+      runAgent(codex, i + 1, prompt, opts, controller.signal, config.json),
     ),
   );
 
-  const results = await Promise.all(tasks);
-
   if (!config.json) {
-    const output = renderTextResults(results);
-    if (output.length > 0) {
-      writeStdoutLine(output);
-    }
+    const text = renderText(results);
+    if (text) out(text);
   }
 
   if (config.output) {
-    const content = config.json ? renderJsonResults(results) : `${renderTextResults(results)}\n`;
+    const content = config.json
+      ? JSON.stringify(results, null, 2)
+      : `${renderText(results)}\n`;
     await writeFile(resolve(config.output), content, "utf8");
-    writeStderrLine(`Wrote results to ${resolve(config.output)}`);
+    log(`Wrote results to ${resolve(config.output)}`);
   }
 
-  return results.every((result) => result.success) ? 0 : 1;
+  return results.every((r) => r.success) ? 0 : 1;
 }
 
 if (import.meta.main) {
-  const exitCode = await main(process.argv.slice(2));
-  process.exit(exitCode);
+  process.exit(await main(process.argv.slice(2)));
 }

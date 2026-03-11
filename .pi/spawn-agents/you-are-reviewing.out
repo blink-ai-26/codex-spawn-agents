@@ -1,0 +1,57 @@
+Actionable findings
+
+src/cli.ts
+- Consolidate duplicated failure handling and JSON emission in runAgent:
+  - The turn.failed and error branches are nearly identical and also duplicate the final “agent.result” JSON emission used in multiple places (failure, aborted, completed). Extract helpers:
+    - emitEvent(agentIdx, prompt, event) – single place to JSONL-emit any ThreadEvent when --json
+    - emitAgentResult({agent, prompt, status, threadId, usage, error, finalResponse}) – single place to emit the summary line
+    - finalizeFailure(message) – builds and returns the AgentResult plus emits JSON summary if requested
+  - This will cut conditional duplication and make future changes safer.
+
+- Prevent accidental clearing of finalResponse in updateFinalResponse:
+  - Currently updates on item.started, item.updated, and item.completed for agent_message. If item.started for agent_message has empty or undefined text, it can wipe the current finalResponse. Tighten the guard to only update on item.updated/item.completed and only when event.item.text is a non-empty string:
+    - if ((event.type === "item.updated" || event.type === "item.completed") && event.item.type === "agent_message" && event.item.text) return event.item.text;
+
+- Reduce parameter sprawl in runAgent:
+  - Pass a single options object (e.g., { codex, task, threadOptions, signal, json }) or capture json and threadOptions in a closure where tasks are created. This improves readability and makes it easier to extend parameters without touching call sites.
+
+- Ensure output directory exists before writing:
+  - Writing to a nested path with -o can fail if parent dirs don’t exist. Before writeFile, do:
+    - const outPath = resolve(config.output);
+    - await mkdir(dirname(outPath), { recursive: true });
+    - await writeFile(outPath, …)
+
+- Avoid recomputing resolve(config.output):
+  - Compute once (const outPath = resolve(config.output)) and reuse for writeFile and the “Wrote results to …” message.
+
+- Strengthen prompt validation in parseCliArgs:
+  - Disallow empty or whitespace-only prompts by trimming and filtering. Error if none remain. This avoids launching no-op agents:
+    - const prompts = rawPrompts.map(p => p.trim()).filter(Boolean); if (!help && prompts.length === 0) throw …
+
+- Add -h alias for --help:
+  - In parseArgs options.help, add short: "h" for a standard UX improvement.
+
+- Make describeEvent exhaustive or add a safe fallback:
+  - New Codex item types could appear and currently return null silently. Either add a default case that emits a generic progress line, or add a never check to surface unhandled types during development.
+
+- Minor I/O ergonomics:
+  - When printing help on error, you currently write both the error and help to stderr, which is good. For consistency, also add a trailing newline after help in the help path (stdout) so terminals end with a clean prompt.
+
+- Packaging clarity (optional but reduces confusion):
+  - package.json "bin" points to src/cli.ts (TypeScript, Bun shebang) while build outputs dist/cli.js. If you intend to publish a compiled artifact, point bin to dist/cli.js post-build. If you intend Bun-only execution from TS, remove build step or clarify in README. This avoids users installing a package that builds a JS file that isn’t wired to the bin.
+
+src/cli.test.ts
+- Add tests for edge cases in parseCliArgs:
+  - Empty/whitespace prompts are rejected.
+  - -h/--help path returns help and does not require prompts.
+  - Conflicting --full-auto with --sandbox workspace-write throws the intended error.
+  - --cwd resolves to an absolute path when provided.
+
+- Add rendering tests for single-agent cases:
+  - Success trims trailing newlines.
+  - Failure shows “Error: …”.
+
+- Add JSON summary test for a failed agent:
+  - Ensure error is included and status is "failed" and finalResponse is preserved.
+
+These changes simplify control flow, reduce duplication, harden input handling, and make the CLI more maintainable without changing user-visible behavior (except improved validation and -h).
